@@ -1,5 +1,5 @@
 ![](https://github.com/viajatech/Editor/blob/main/Editor%20GUI.png).
-![](https://github.com/viajatech/Editor/blob/main/00000-3946408561.png)
+![](https://github.com/viajatech/Editor/blob/main/Editor%20GUI.png)
 ----
 # ViajaTech Editor 🚀✨
 
