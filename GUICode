@@ -1,0 +1,541 @@
+# Asegúrate de instalar las siguientes bibliotecas antes de ejecutar el script:
+# pip install onnxruntime rembg numpy Pillow opencv-python
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk, ImageDraw, ImageChops
+from rembg import remove, new_session
+import numpy as np
+import os
+import io
+import platform
+
+# Crear una sesión con el modelo "u2net_human_seg"
+session = new_session('u2net_human_seg')
+
+class ImageEditor:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("ViajaTech Editor")  # Título actualizado
+        self.master.geometry("1800x1100")  # Aumentar el tamaño para mejor visualización
+
+        # Variables para Zoom
+        self.zoom_level = 1.0
+        self.min_zoom = 0.1
+        self.max_zoom = 5.0
+        self.zoom_step = 0.1
+
+        # Frame para los botones y controles
+        self.control_frame = tk.Frame(master)
+        self.control_frame.pack(pady=10)
+
+        # Botones
+        self.select_button = tk.Button(self.control_frame, text="Seleccionar Imágenes", command=self.select_images, width=20)
+        self.select_button.grid(row=0, column=0, padx=5)
+
+        self.clear_button = tk.Button(self.control_frame, text="Limpiar Lista", command=self.clear_list, width=20)
+        self.clear_button.grid(row=0, column=1, padx=5)
+
+        self.process_button = tk.Button(self.control_frame, text="Procesar Fondos", command=self.remove_backgrounds, width=20)
+        self.process_button.grid(row=0, column=2, padx=5)
+
+        self.save_button = tk.Button(self.control_frame, text="Guardar Imagen", command=self.save_image, width=20, state=tk.DISABLED)
+        self.save_button.grid(row=0, column=3, padx=5)
+
+        # Frame para la barra deslizante y la previsualización del pincel
+        self.brush_frame = tk.Frame(self.control_frame)
+        self.brush_frame.grid(row=0, column=4, padx=20)
+
+        # Barra deslizante para ajustar el tamaño del pincel
+        self.brush_size_label = tk.Label(self.brush_frame, text="Tamaño del Pincel:")
+        self.brush_size_label.pack()
+
+        # Canvas para la barra deslizante y la previsualización del pincel
+        self.brush_canvas = tk.Canvas(self.brush_frame, width=300, height=80, bg='white', highlightthickness=0)
+        self.brush_canvas.pack()
+
+        # Crear la barra deslizante dentro del Canvas
+        self.brush_size = tk.IntVar(value=15)  # Valor inicial del pincel
+        self.brush_size_slider = tk.Scale(
+            self.brush_canvas, from_=1, to=100, orient=tk.HORIZONTAL,
+            variable=self.brush_size, show=0, length=280, sliderlength=20,
+            command=self.update_brush_preview
+        )
+        self.brush_size_slider.pack(pady=10)
+
+        # Definir el color del pincel antes de la previsualización
+        self.brush_color = 'red'  # Color de la superposición
+
+        # Dibujar la previsualización del pincel sobre la barra deslizante
+        self.brush_preview = self.brush_canvas.create_oval(
+            0, 0, 0, 0, fill=self.brush_color, outline='black', tags="brush_preview"
+        )
+        self.brush_preview_text = self.brush_canvas.create_text(
+            0, 0, text="", fill='black', tags="brush_preview"
+        )
+        self.update_brush_preview()
+
+        # Listbox para mostrar los archivos seleccionados
+        self.listbox = tk.Listbox(master, selectmode=tk.SINGLE, width=160, height=10)
+        self.listbox.pack(pady=10)
+        self.listbox.bind('<<ListboxSelect>>', self.display_selected_image)
+
+        # Canvas para mostrar y editar la imagen con Scrollbars
+        self.canvas_frame = tk.Frame(master)
+        self.canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.h_scroll = tk.Scrollbar(self.canvas_frame, orient=tk.HORIZONTAL)
+        self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.v_scroll = tk.Scrollbar(self.canvas_frame, orient=tk.VERTICAL)
+        self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.canvas = tk.Canvas(
+            self.canvas_frame, cursor="cross", bg='grey',
+            xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.h_scroll.config(command=self.canvas.xview)
+        self.v_scroll.config(command=self.canvas.yview)
+
+        self.canvas_image = None
+        self.current_image = None
+        self.original_image = None  # Para mantener la imagen original
+        self.current_image_resized = None
+        self.mask = None
+        self.overlay = None  # Superposición para visualización
+        self.draw_mask = None
+        self.draw_overlay = None
+        self.drawing = False
+        self.last_x, self.last_y = None, None
+
+        # Círculo de previsualización del pincel en la imagen
+        self.cursor_preview = None
+
+        # Variables para gestionar múltiples imágenes
+        self.images = []
+        self.processed_images = {}
+        self.masks = {}  # Almacenar máscaras por imagen
+
+        # Bindear eventos para el zoom con la rueda del mouse
+        self.bind_zoom()
+
+        # Bindear eventos para el borrado con el botón derecho del mouse
+        self.bind_eraser()
+
+    def bind_zoom(self):
+        system = platform.system()
+        if system == 'Windows':
+            self.canvas.bind("<MouseWheel>", self.on_mousewheel)
+        elif system == 'Darwin':  # macOS
+            self.canvas.bind("<MouseWheel>", self.on_mousewheel)
+        else:  # Linux y otros
+            self.canvas.bind("<Button-4>", self.on_mousewheel)
+            self.canvas.bind("<Button-5>", self.on_mousewheel)
+
+    def on_mousewheel(self, event):
+        if platform.system() == 'Windows' or platform.system() == 'Darwin':
+            if event.delta > 0:
+                self.zoom_in()
+            elif event.delta < 0:
+                self.zoom_out()
+        else:
+            if event.num == 4:
+                self.zoom_in()
+            elif event.num == 5:
+                self.zoom_out()
+
+    def zoom_in(self):
+        if self.zoom_level < self.max_zoom:
+            self.zoom_level += self.zoom_step
+            self.display_image_on_canvas(self.original_image)
+
+    def zoom_out(self):
+        if self.zoom_level > self.min_zoom:
+            self.zoom_level -= self.zoom_step
+            self.display_image_on_canvas(self.original_image)
+
+    def bind_eraser(self):
+        system = platform.system()
+        if system == 'Windows' or system == 'Darwin':
+            self.canvas.bind("<ButtonPress-3>", self.on_eraser_press)
+            self.canvas.bind("<B3-Motion>", self.on_eraser_paint)
+            self.canvas.bind("<ButtonRelease-3>", self.on_eraser_release)
+        else:
+            # En Linux, el botón derecho puede ser <Button-3>
+            self.canvas.bind("<ButtonPress-3>", self.on_eraser_press)
+            self.canvas.bind("<B3-Motion>", self.on_eraser_paint)
+            self.canvas.bind("<ButtonRelease-3>", self.on_eraser_release)
+
+    def on_eraser_press(self, event):
+        if self.current_image:
+            self.erasing = True
+            self.last_x, self.last_y = event.x, event.y
+            self.erase(event)
+
+    def on_eraser_paint(self, event):
+        if self.erasing and self.current_image:
+            self.erase(event)
+
+    def on_eraser_release(self, event):
+        self.erasing = False
+
+    def erase(self, event):
+        x, y = event.x, event.y
+        # Convertir coordenadas del canvas a las de la imagen original
+        if not self.canvas_image:
+            return
+        bbox = self.canvas.bbox(self.canvas_image)
+        if not bbox:
+            return
+        img_width, img_height = self.original_image.size
+        display_width = int(img_width * self.zoom_level)
+        display_height = int(img_height * self.zoom_level)
+        scale_x = img_width / display_width
+        scale_y = img_height / display_height
+
+        # Coordenadas relativas al inicio de la imagen en el canvas
+        rel_x = (x - bbox[0]) * scale_x
+        rel_y = (y - bbox[1]) * scale_y
+
+        if 0 <= rel_x < img_width and 0 <= rel_y < img_height:
+            image_path = self.listbox.get(self.listbox.curselection())
+
+            # Obtener el tamaño del pincel actual
+            current_brush_size = self.brush_size.get()
+
+            # Dibujar en la máscara (eliminar)
+            self.draw_mask.ellipse(
+                (rel_x - current_brush_size, rel_y - current_brush_size,
+                 rel_x + current_brush_size, rel_y + current_brush_size),
+                fill=0
+            )
+
+            # Dibujar en la superposición (eliminar)
+            self.draw_overlay.ellipse(
+                (rel_x - current_brush_size, rel_y - current_brush_size,
+                 rel_x + current_brush_size, rel_y + current_brush_size),
+                fill=(0, 0, 0, 0)  # Transparente
+            )
+
+            # Actualizar la visualización
+            self.update_canvas_with_overlay()
+
+    def select_images(self):
+        file_paths = filedialog.askopenfilenames(
+            title="Seleccionar Imágenes",
+            filetypes=[("Archivos de Imagen", "*.png;*.jpg;*.jpeg;*.bmp")]
+        )
+        if file_paths:
+            for file_path in file_paths:
+                if file_path not in self.images:
+                    self.images.append(file_path)
+                    self.listbox.insert(tk.END, file_path)
+
+    def clear_list(self):
+        self.listbox.delete(0, tk.END)
+        self.images.clear()
+        self.canvas.delete("all")
+        self.current_image = None
+        self.original_image = None
+        self.current_image_resized = None
+        self.processed_images.clear()
+        self.masks.clear()
+        self.save_button.config(state=tk.DISABLED)
+
+    def display_selected_image(self, event):
+        selection = self.listbox.curselection()
+        if selection:
+            index = selection[0]
+            image_path = self.listbox.get(index)
+            image = Image.open(image_path).convert("RGBA")
+            self.original_image = image.copy()  # Guardar la imagen original para zoom
+            self.current_image = image
+            self.current_image_resized = image.copy()
+            self.processed_images[image_path] = image.copy()
+
+            # Inicializar máscara y superposición para esta imagen si no existen
+            if image_path not in self.masks:
+                self.masks[image_path] = Image.new("L", image.size, 0)  # Todo transparente
+            self.draw_mask = ImageDraw.Draw(self.masks[image_path])
+
+            # Inicializar superposición (semi-transparente)
+            self.overlay = Image.new("RGBA", image.size, (255, 0, 0, 0))  # Inicialmente transparente
+            self.draw_overlay = ImageDraw.Draw(self.overlay)
+
+            self.zoom_level = 1.0  # Resetear zoom al seleccionar una nueva imagen
+            self.display_image_on_canvas(image)
+            self.save_button.config(state=tk.NORMAL)
+
+    def display_image_on_canvas(self, image):
+        # Redimensionar la imagen según el nivel de zoom
+        zoomed_image = image.resize(
+            (int(image.width * self.zoom_level), int(image.height * self.zoom_level)),
+            Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+        )
+        self.current_image_resized = zoomed_image
+        self.tk_image = ImageTk.PhotoImage(zoomed_image)
+
+        # Crear una copia para la superposición
+        if self.overlay:
+            zoomed_overlay = self.overlay.resize(
+                (zoomed_image.width, zoomed_image.height),
+                Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+            )
+            self.tk_overlay = ImageTk.PhotoImage(zoomed_overlay)
+
+            # Combinar la imagen y la superposición
+            combined = Image.alpha_composite(zoomed_image, zoomed_overlay)
+            self.tk_combined = ImageTk.PhotoImage(combined)
+            self.canvas.delete("all")
+            self.canvas_image = self.canvas.create_image(
+                0, 0, anchor=tk.NW, image=self.tk_combined
+            )
+        else:
+            self.canvas.delete("all")
+            self.canvas_image = self.canvas.create_image(
+                0, 0, anchor=tk.NW, image=self.tk_image
+            )
+
+        self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
+
+        # Bindear eventos del mouse para la selección y la previsualización del pincel
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_paint)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+        self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.bind("<Leave>", self.on_mouse_leave)
+
+        # Crear o actualizar el círculo de previsualización del pincel
+        if self.cursor_preview:
+            self.canvas.delete(self.cursor_preview)
+        self.cursor_preview = self.canvas.create_oval(
+            0, 0, 0, 0,
+            outline=self.brush_color, width=2, tags="cursor_preview"
+        )
+
+    def on_mouse_move(self, event):
+        if self.current_image:
+            # Obtener las coordenadas en la imagen original
+            x, y = event.x, event.y
+            bbox = self.canvas.bbox(self.canvas_image)
+            if not bbox:
+                return
+            # Verificar si el mouse está dentro de la imagen
+            if bbox[0] <= x <= bbox[0] + self.current_image_resized.width and \
+               bbox[1] <= y <= bbox[1] + self.current_image_resized.height:
+                # Posición relativa en la imagen
+                rel_x = (x - bbox[0]) / self.zoom_level
+                rel_y = (y - bbox[1]) / self.zoom_level
+
+                # Dibujar el círculo de previsualización del pincel
+                brush_size = self.brush_size.get()
+                zoomed_brush_size = brush_size * self.zoom_level
+
+                self.canvas.coords(
+                    self.cursor_preview,
+                    x - zoomed_brush_size, y - zoomed_brush_size,
+                    x + zoomed_brush_size, y + zoomed_brush_size
+                )
+            else:
+                # Si el mouse está fuera de la imagen, ocultar el círculo
+                self.canvas.coords(self.cursor_preview, 0, 0, 0, 0)
+
+    def on_mouse_leave(self, event):
+        if self.cursor_preview:
+            self.canvas.coords(self.cursor_preview, 0, 0, 0, 0)
+
+    def on_button_press(self, event):
+        if self.current_image:
+            self.drawing = True
+            self.last_x, self.last_y = event.x, event.y
+
+    def on_paint(self, event):
+        if self.drawing and self.current_image:
+            x, y = event.x, event.y
+            # Convertir coordenadas del canvas a las de la imagen original
+            if not self.canvas_image:
+                return
+            bbox = self.canvas.bbox(self.canvas_image)
+            if not bbox:
+                return
+            img_width, img_height = self.original_image.size
+            display_width = int(img_width * self.zoom_level)
+            display_height = int(img_height * self.zoom_level)
+            scale_x = img_width / display_width
+            scale_y = img_height / display_height
+
+            # Coordenadas relativas al inicio de la imagen en el canvas
+            rel_x = (x - bbox[0]) * scale_x
+            rel_y = (y - bbox[1]) * scale_y
+
+            if 0 <= rel_x < img_width and 0 <= rel_y < img_height:
+                image_path = self.listbox.get(self.listbox.curselection())
+
+                # Obtener el tamaño del pincel actual
+                current_brush_size = self.brush_size.get()
+
+                # Dibujar en la máscara
+                self.draw_mask.ellipse(
+                    (rel_x - current_brush_size, rel_y - current_brush_size,
+                     rel_x + current_brush_size, rel_y + current_brush_size),
+                    fill=255
+                )
+
+                # Dibujar en la superposición
+                self.draw_overlay.ellipse(
+                    (rel_x - current_brush_size, rel_y - current_brush_size,
+                     rel_x + current_brush_size, rel_y + current_brush_size),
+                    fill=(255, 0, 0, 100)  # Rojo semi-transparente
+                )
+
+                # Actualizar la visualización
+                self.update_canvas_with_overlay()
+
+    def on_button_release(self, event):
+        self.drawing = False
+
+    def update_canvas_with_overlay(self):
+        if self.current_image and self.overlay:
+            # Redimensionar imágenes según el zoom
+            zoomed_image = self.current_image.resize(
+                (int(self.current_image.width * self.zoom_level), int(self.current_image.height * self.zoom_level)),
+                Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+            )
+            zoomed_overlay = self.overlay.resize(
+                (zoomed_image.width, zoomed_image.height),
+                Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+            )
+
+            # Combinar la imagen y la superposición
+            combined = Image.alpha_composite(zoomed_image, zoomed_overlay)
+            self.tk_combined = ImageTk.PhotoImage(combined)
+
+            # Actualizar el Canvas
+            self.canvas.itemconfig(self.canvas_image, image=self.tk_combined)
+
+    def remove_backgrounds(self):
+        if not self.images:
+            messagebox.showwarning("Advertencia", "No hay imágenes seleccionadas.")
+            return
+        output_dir = filedialog.askdirectory(title="Seleccionar Carpeta de Salida")
+        if not output_dir:
+            return
+        for image_path in self.images:
+            try:
+                with open(image_path, "rb") as inp_file:
+                    input_data = inp_file.read()
+                    # Usar la sesión creada con el modelo deseado
+                    output_data = remove(input_data, session=session)
+                    output_image = Image.open(io.BytesIO(output_data)).convert("RGBA")
+
+                    # Si el usuario ha hecho una selección, aplicar la máscara
+                    if image_path in self.masks:
+                        mask = self.masks[image_path]
+                        # Redimensionar la máscara al tamaño de output_image si es necesario
+                        if mask.size != output_image.size:
+                            mask_resized = mask.resize(output_image.size, Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
+                        else:
+                            mask_resized = mask
+
+                        # Obtener el alpha de rembg
+                        rembg_alpha = output_image.split()[-1]
+
+                        # Combinar rembg_alpha y user_mask
+                        final_alpha = ImageChops.multiply(rembg_alpha, mask_resized)
+
+                        # Aplicar el alpha combinado
+                        output_image.putalpha(final_alpha)
+
+                    # Guardar la imagen con el fondo eliminado
+                    output_path = os.path.join(output_dir, f"bg_removed_{os.path.basename(image_path)}")
+                    output_image.save(output_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo procesar {image_path}: {e}")
+        messagebox.showinfo("Éxito", "¡Fondos eliminados exitosamente!")
+
+    def save_image(self):
+        if not self.current_image:
+            messagebox.showwarning("Advertencia", "No hay imagen para guardar.")
+            return
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("BMP", "*.bmp")],
+            title="Guardar Imagen"
+        )
+        if save_path:
+            image_path = self.listbox.get(self.listbox.curselection())
+            try:
+                # Aplicar la máscara antes de guardar
+                with open(image_path, "rb") as inp_file:
+                    input_data = inp_file.read()
+                    output_data = remove(input_data, session=session)
+                    output_image = Image.open(io.BytesIO(output_data)).convert("RGBA")
+
+                    mask = self.masks.get(image_path)
+                    if mask:
+                        if mask.size != output_image.size:
+                            mask_resized = mask.resize(output_image.size, Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
+                        else:
+                            mask_resized = mask
+
+                        # Obtener el alpha de rembg
+                        rembg_alpha = output_image.split()[-1]
+
+                        # Combinar rembg_alpha y user_mask
+                        final_alpha = ImageChops.multiply(rembg_alpha, mask_resized)
+
+                        # Aplicar el alpha combinado
+                        output_image.putalpha(final_alpha)
+                    else:
+                        messagebox.showwarning("Advertencia", "No hay máscara para esta imagen. Se guardará la imagen sin modificaciones.")
+
+                    output_image.save(save_path)
+                    messagebox.showinfo("Éxito", f"Imagen guardada en {save_path}")
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo guardar la imagen: {e}")
+
+    def update_brush_preview(self, event=None):
+        # Obtener el tamaño actual del pincel
+        size = self.brush_size.get()
+
+        # Limpiar la previsualización anterior
+        self.brush_canvas.delete("brush_preview")
+
+        # Calcular la proporción del valor actual en el rango
+        proportion = (self.brush_size.get() - self.brush_size_slider.cget("from")) / (self.brush_size_slider.cget("to") - self.brush_size_slider.cget("from"))
+        proportion = max(0, min(1, proportion))  # Limitar entre 0 y 1
+
+        # Posición x del thumb
+        slider_length = 280  # Debe coincidir con la longitud del slider
+        slider_start_x = 10  # Margen izquierdo
+        thumb_x = slider_start_x + proportion * slider_length
+
+        # Posición y (centrado verticalmente)
+        slider_start_y = 30  # Posición vertical del slider
+        thumb_y = slider_start_y
+
+        # Dibujar el círculo de previsualización sobre el slider
+        self.brush_preview = self.brush_canvas.create_oval(
+            thumb_x - size, thumb_y - size,
+            thumb_x + size, thumb_y + size,
+            fill=self.brush_color, outline='black', tags="brush_preview"
+        )
+
+        # Mostrar el tamaño numérico del pincel
+        self.brush_canvas.create_text(
+            thumb_x, thumb_y + size + 10,
+            text=str(size), fill='black', tags="brush_preview"
+        )
+
+        # Asegurar que la previsualización esté por encima de otros elementos
+        self.brush_canvas.tag_raise("brush_preview")
+
+def main():
+    root = tk.Tk()
+    app = ImageEditor(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
