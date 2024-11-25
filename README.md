@@ -30,3 +30,4 @@ Transforma tu flujo de trabajo de edición de imágenes con ViajaTech Editor. Di
 **ViajaTech Editor** es más que una herramienta: es tu compañero creativo para crear visuales impecables. Sumérgete, explora las posibilidades y eleva tu edición de imágenes a nuevas alturas.
 
 ---
+![](https://github.com/viajatech/Editor/blob/main/FLUX%20GUI%20EDITOR.png)
